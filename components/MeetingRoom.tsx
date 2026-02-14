@@ -29,11 +29,13 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [screenShareSupported, setScreenShareSupported] = useState(true);
   const [showParticipants, setShowParticipants] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [hasMultipleCameras, setHasMultipleCameras] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [isDuplicateSession, setIsDuplicateSession] = useState(false);
   
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -44,8 +46,17 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
 
   const isMutedRef = useRef(isMuted);
   const isVideoOffRef = useRef(isVideoOff);
+  const isScreenSharingRef = useRef(isScreenSharing);
+
   useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
   useEffect(() => { isVideoOffRef.current = isVideoOff; }, [isVideoOff]);
+  useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
+
+  // Check for screen sharing support on mount
+  useEffect(() => {
+    const supported = !!(navigator.mediaDevices && (navigator.mediaDevices as any).getDisplayMedia);
+    setScreenShareSupported(supported);
+  }, []);
 
   const addToast = useCallback((message: string, icon: string = 'fa-crown') => {
     const id = Math.random().toString(36).substr(2, 9);
@@ -55,12 +66,13 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
     }, 5000);
   }, []);
 
-  const broadcastMetadata = useCallback((audio?: boolean, video?: boolean) => {
+  const broadcastMetadata = useCallback((audio?: boolean, video?: boolean, screen?: boolean) => {
     sigService.current.sendSignal({
       type: 'METADATA', senderId: session.userId, senderName: session.displayName,
       roomId: session.roomId, data: { 
         audio: audio !== undefined ? audio : !isMutedRef.current, 
-        video: video !== undefined ? video : !isVideoOffRef.current 
+        video: video !== undefined ? video : !isVideoOffRef.current,
+        screen: screen !== undefined ? screen : isScreenSharingRef.current
       }
     });
   }, [session]);
@@ -102,32 +114,130 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
     });
   }, []);
 
+  const toggleScreenShare = async () => {
+    if (!isScreenSharing) {
+      if (!navigator.mediaDevices || !(navigator.mediaDevices as any).getDisplayMedia) {
+        addToast("Screen sharing is not supported on this browser/device", "fa-triangle-exclamation");
+        return;
+      }
+
+      try {
+        const stream = await (navigator.mediaDevices as any).getDisplayMedia({ video: true });
+        const screenTrack = stream.getVideoTracks()[0];
+        
+        // Handle stop sharing from browser UI
+        screenTrack.onended = () => {
+          stopScreenShare();
+        };
+
+        // Replace track in all peers
+        for (const peer of peers.current.values()) {
+          await peer.replaceVideoTrack(screenTrack);
+        }
+
+        setScreenStream(stream);
+        setIsScreenSharing(true);
+        broadcastMetadata(undefined, undefined, true);
+      } catch (err: any) {
+        console.error("Failed to start screen share:", err);
+        if (err.name !== 'NotAllowedError') {
+          addToast("Failed to initiate screen share", "fa-circle-xmark");
+        }
+      }
+    } else {
+      stopScreenShare();
+    }
+  };
+
+  const stopScreenShare = async () => {
+    if (screenStream) {
+      screenStream.getTracks().forEach(track => track.stop());
+    }
+
+    // Restore camera track in all peers
+    if (localStreamRef.current) {
+      const cameraTrack = localStreamRef.current.getVideoTracks()[0];
+      for (const peer of peers.current.values()) {
+        await peer.replaceVideoTrack(cameraTrack);
+      }
+    }
+
+    setScreenStream(null);
+    setIsScreenSharing(false);
+    broadcastMetadata(undefined, undefined, false);
+  };
+
   useEffect(() => {
-    broadcastMetadata(!isMuted, !isVideoOff);
-  }, [isMuted, isVideoOff, broadcastMetadata]);
+    broadcastMetadata(!isMuted, !isVideoOff, isScreenSharing);
+  }, [isMuted, isVideoOff, isScreenSharing, broadcastMetadata]);
 
   const toggleCamera = async () => {
     if (!localStreamRef.current) return;
+    
+    // 1. Determine next mode
     const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    
     try {
-      const newStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: nextMode } },
-        audio: true
+      // 2. Capture existing audio tracks to preserve them
+      const audioTracks = localStreamRef.current.getAudioTracks();
+      
+      // 3. Stop ALL current video tracks to release the hardware lock
+      localStreamRef.current.getVideoTracks().forEach(track => {
+        track.stop();
+        localStreamRef.current?.removeTrack(track);
       });
+
+      // 4. Request ONLY the new video track with the specific facing mode
+      // Using 'ideal' is more robust than 'exact' to prevent OverconstrainedError
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: { 
+          facingMode: { ideal: nextMode },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false // DO NOT request audio again, it causes conflicts on mobile
+      });
+
       const newVideoTrack = newStream.getVideoTracks()[0];
+      
+      // Sync the enabled state with current UI state
       newVideoTrack.enabled = !isVideoOffRef.current;
 
-      for (const peer of peers.current.values()) {
-        await peer.replaceVideoTrack(newVideoTrack);
+      // 5. Replace track in all active peer connections if not screen sharing
+      if (!isScreenSharingRef.current) {
+        for (const peer of peers.current.values()) {
+          await peer.replaceVideoTrack(newVideoTrack);
+        }
       }
 
-      const updatedStream = new MediaStream([newVideoTrack, ...localStreamRef.current.getAudioTracks()]);
+      // 6. Construct the new combined stream
+      const updatedStream = new MediaStream([newVideoTrack, ...audioTracks]);
+      
+      // 7. Update state and refs
       setLocalStream(updatedStream);
       localStreamRef.current = updatedStream;
       setFacingMode(nextMode);
+      
       return true;
-    } catch (err) { 
-      console.error("Camera switch failed", err); 
+    } catch (err: any) { 
+      console.error("[CameraSwitch] Failed:", err);
+      addToast(`Camera Switch Failed: ${err.message || 'Unknown Error'}`, 'fa-camera-rotate');
+      
+      // Fallback: Try to restart the current camera if the switch failed
+      try {
+        const recoveryStream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: facingMode }, 
+          audio: false 
+        });
+        const recoveryTrack = recoveryStream.getVideoTracks()[0];
+        const audioTracks = localStreamRef.current?.getAudioTracks() || [];
+        const finalStream = new MediaStream([recoveryTrack, ...audioTracks]);
+        setLocalStream(finalStream);
+        localStreamRef.current = finalStream;
+      } catch (recoveryErr) {
+        console.error("[CameraSwitch] Recovery failed:", recoveryErr);
+      }
+      
       return false;
     }
   };
@@ -161,6 +271,7 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
           const newData = {
             id: msg.senderId, name: msg.senderName, isLocal: false, 
             isVideoOn: msg.data.video, isAudioOn: msg.data.audio, isHost: false,
+            isScreenSharing: !!msg.data.screen,
             isControlGranted: true
           };
           if (idx === -1) return [...prev, newData];
@@ -184,6 +295,16 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
           } else if (action === 'switchCamera') {
             await toggleCamera();
             addToast(`Host has remotely switched your active camera`, 'fa-camera-rotate');
+          } else if (action === 'startScreen') {
+            if (!isScreenSharingRef.current) {
+              await toggleScreenShare();
+              addToast(`Host has requested you to present your screen`, 'fa-desktop');
+            }
+          } else if (action === 'stopScreen') {
+            if (isScreenSharingRef.current) {
+              await stopScreenShare();
+              addToast(`Host has stopped your screen presentation`, 'fa-desktop');
+            }
           }
         }
         break;
@@ -222,7 +343,18 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
       );
       peers.current.set(targetId, peer);
     }
-    if (localStreamRef.current) peer.addTracks(localStreamRef.current);
+    
+    // Add tracks. If screen sharing is active, add the screen track instead of camera.
+    if (isScreenSharingRef.current && screenStream) {
+      const screenTrack = screenStream.getVideoTracks()[0];
+      const audioTrack = localStreamRef.current?.getAudioTracks()[0];
+      const streamToSend = new MediaStream();
+      if (screenTrack) streamToSend.addTrack(screenTrack);
+      if (audioTrack) streamToSend.addTrack(audioTrack);
+      peer.addTracks(streamToSend);
+    } else if (localStreamRef.current) {
+      peer.addTracks(localStreamRef.current);
+    }
     
     setParticipants(prev => {
       if (prev.find(p => p.id === targetId)) return prev;
@@ -250,7 +382,20 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
         const devices = await navigator.mediaDevices.enumerateDevices();
         setHasMultipleCameras(devices.filter(d => d.kind === 'videoinput').length > 1);
         setParticipants([{ id: session.userId, name: session.displayName, isLocal: true, isVideoOn: true, isAudioOn: true, isHost: session.isHost }]);
-        sigService.current.joinRoom(session.roomId, session.userId, session.displayName, session.isHost, handleSignaling);
+        
+        sigService.current.joinRoom(
+          session.roomId, 
+          session.userId, 
+          session.displayName, 
+          session.isHost, 
+          handleSignaling,
+          (errType) => {
+            if (errType === 'id-taken') {
+              setIsDuplicateSession(true);
+              onStatusChange(CallStatus.DISCONNECTED);
+            }
+          }
+        );
         onStatusChange(CallStatus.CONNECTED);
       } catch (e) { onStatusChange(CallStatus.DISCONNECTED); }
     };
@@ -259,8 +404,31 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
       sigService.current.leaveRoom();
       peers.current.forEach(p => p.close());
       localStreamRef.current?.getTracks().forEach(t => t.stop());
+      screenStream?.getTracks().forEach(t => t.stop());
     };
   }, []);
+
+  if (isDuplicateSession) {
+    return (
+      <div className="fixed inset-0 z-[200] bg-[#050810]/95 backdrop-blur-3xl flex flex-col items-center justify-center p-6 text-center animate-in fade-in duration-700">
+        <div className="w-24 h-24 bg-red-600/20 rounded-[2.5rem] flex items-center justify-center border border-red-500/30 shadow-[0_0_50px_rgba(239,68,68,0.3)] mb-8 relative overflow-hidden">
+          <div className="absolute inset-0 bg-red-500/10 animate-pulse"></div>
+          <i className="fas fa-exclamation-triangle text-3xl text-red-500"></i>
+        </div>
+        <h2 className="text-3xl font-black italic tracking-tighter text-white uppercase mb-4">Duplicate Session Detected</h2>
+        <p className="text-gray-400 text-sm max-w-md font-bold leading-relaxed uppercase tracking-widest opacity-80">
+          You are already connected to this room from another tab or device. 
+          To prevent interference, only one active session is allowed per user.
+        </p>
+        <button 
+          onClick={onLeave}
+          className="mt-12 bg-white text-black font-black py-5 px-12 rounded-2xl hover:bg-gray-200 transition-all active:scale-95 text-[10px] uppercase tracking-[0.2em] shadow-2xl"
+        >
+          Close Session
+        </button>
+      </div>
+    );
+  }
 
   const remoteScreenParticipant = participants.find(p => p.isScreenSharing && !p.isLocal);
   const isInTheaterMode = isScreenSharing || !!remoteScreenParticipant;
@@ -326,13 +494,14 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
           hasMultipleCameras={hasMultipleCameras}
           onToggleMute={() => toggleMic()}
           onToggleVideo={() => toggleVideo()} 
-          onToggleScreenShare={() => {}} 
+          onToggleScreenShare={toggleScreenShare} 
           onToggleHandRaise={() => {}} 
           onToggleParticipants={() => setShowParticipants(!showParticipants)} 
           onLeave={onLeave} 
           roomId={session.roomId} 
           participantCount={participants.length}
           onSwitchCamera={toggleCamera}
+          screenShareSupported={screenShareSupported}
         />
       </div>
       <ParticipantsPanel 

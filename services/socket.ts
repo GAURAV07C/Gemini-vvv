@@ -17,6 +17,7 @@ export class SignalingService {
   private userIdToPeerId: Map<string, string> = new Map(); // Maps UserID to PeerID
   private userIdToName: Map<string, string> = new Map(); // Maps UserID to Name
   private onMessageCallback: ((msg: SignalPayload) => void) | null = null;
+  private onErrorCallback: ((errType: string) => void) | null = null;
   private userId: string = '';
   private userName: string = '';
   private roomId: string = '';
@@ -34,8 +35,16 @@ export class SignalingService {
     this.onMessageCallback = onMessage;
   }
 
-  joinRoom(roomId: string, userId: string, displayName: string, isHost: boolean, onMessage: (msg: SignalPayload) => void) {
+  joinRoom(
+    roomId: string, 
+    userId: string, 
+    displayName: string, 
+    isHost: boolean, 
+    onMessage: (msg: SignalPayload) => void,
+    onError?: (errType: string) => void
+  ) {
     this.onMessageCallback = onMessage;
+    this.onErrorCallback = onError || null;
     this.userId = userId;
     this.userName = displayName;
     this.roomId = roomId.toUpperCase();
@@ -73,11 +82,13 @@ export class SignalingService {
 
     this.peer.on('error', (err) => {
       console.warn('[Socket] Signaling Error:', err.type);
-      // Handle ID taken - usually happens if refresh is too fast and old connection is still alive
-      if (err.type === 'id-taken' && !isHost) {
-        console.log('[Socket] Peer ID taken, retrying with suffix...');
-        // Fallback to random suffix if primary ID is locked
-        this.joinRoom(roomId, `${userId}_${Math.floor(Math.random() * 1000)}`, displayName, isHost, onMessage);
+      
+      // If ID is taken, it means this user (or another tab with same session) is already connected
+      if (err.type === 'id-taken') {
+        this.onErrorCallback?.('id-taken');
+        // Do not retry with suffix to enforce "one user per device" rule
+      } else {
+        this.onErrorCallback?.(err.type);
       }
     });
   }

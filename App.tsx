@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { CallStatus, UserSession, RecentRoom } from './types';
 import SetupScreen from './components/SetupScreen';
 import MeetingRoom from './components/MeetingRoom';
@@ -14,8 +14,30 @@ const App: React.FC = () => {
   const [recentRooms, setRecentRooms] = useState<RecentRoom[]>([]);
   const [status, setStatus] = useState<CallStatus>(CallStatus.IDLE);
   const [isRejoining, setIsRejoining] = useState(false);
+  const [isDuplicateTab, setIsDuplicateTab] = useState(false);
+  
+  const tabSyncChannel = useRef<BroadcastChannel | null>(null);
 
   useEffect(() => {
+    // Tab Synchronization Logic
+    tabSyncChannel.current = new BroadcastChannel('omni-rtc-tab-sync');
+    
+    tabSyncChannel.current.onmessage = (event) => {
+      if (event.data === 'PING_ACTIVE_MEETING') {
+        if (view === 'MEETING') {
+          tabSyncChannel.current?.postMessage('MEETING_ACTIVE');
+        }
+      }
+      if (event.data === 'MEETING_ACTIVE') {
+        if (view !== 'MEETING') {
+          setIsDuplicateTab(true);
+        }
+      }
+    };
+
+    // Check if meeting is active elsewhere
+    tabSyncChannel.current.postMessage('PING_ACTIVE_MEETING');
+
     const savedHistory = localStorage.getItem(HISTORY_KEY);
     if (savedHistory) {
       try { setRecentRooms(JSON.parse(savedHistory)); } catch (e) { localStorage.removeItem(HISTORY_KEY); }
@@ -34,7 +56,9 @@ const App: React.FC = () => {
         }
       } catch (e) { localStorage.removeItem(SESSION_KEY); }
     }
-  }, []);
+
+    return () => tabSyncChannel.current?.close();
+  }, [view]);
 
   const handleJoinRoom = useCallback((roomId: string, name: string, isHost: boolean, existingId?: string) => {
     const userId = existingId || `user_${Math.random().toString(36).substr(2, 9)}`;
@@ -51,6 +75,7 @@ const App: React.FC = () => {
     setCurrentSession(session);
     setView('MEETING');
     setStatus(CallStatus.CONNECTING);
+    tabSyncChannel.current?.postMessage('MEETING_STARTED');
   }, []);
 
   const handleLeave = useCallback(() => {
@@ -58,7 +83,29 @@ const App: React.FC = () => {
     setCurrentSession(null);
     setView('SETUP');
     setStatus(CallStatus.IDLE);
+    setIsDuplicateTab(false);
+    tabSyncChannel.current?.postMessage('MEETING_ENDED');
   }, []);
+
+  if (isDuplicateTab && view !== 'MEETING') {
+    return (
+      <div className="min-h-screen bg-[#050810] flex flex-col items-center justify-center p-8 text-center animate-in fade-in duration-700">
+        <div className="w-20 h-20 bg-blue-600/10 rounded-3xl flex items-center justify-center border border-blue-500/20 shadow-2xl mb-8">
+          <i className="fas fa-layer-group text-2xl text-blue-500 animate-pulse"></i>
+        </div>
+        <h2 className="text-2xl font-black italic tracking-tighter text-white uppercase mb-4">Active Meeting Found</h2>
+        <p className="text-gray-500 text-[10px] font-black uppercase tracking-widest max-w-xs leading-loose">
+          OmniRTC is already running in another tab. Please close other sessions to start a new one on this device.
+        </p>
+        <button 
+          onClick={() => setIsDuplicateTab(false)}
+          className="mt-10 text-blue-400 font-black text-[9px] uppercase tracking-widest hover:text-blue-300 transition-colors"
+        >
+          Check Again
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4">

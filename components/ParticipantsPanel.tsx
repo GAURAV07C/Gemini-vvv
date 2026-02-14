@@ -7,7 +7,7 @@ interface ParticipantsPanelProps {
   participants: Participant[];
   onClose: () => void;
   isHost: boolean;
-  onRemoteCommand?: (id: string, action: 'toggleMic' | 'toggleVideo' | 'startScreen' | 'switchCamera') => void;
+  onRemoteCommand?: (id: string, action: 'toggleMic' | 'toggleVideo' | 'startScreen' | 'stopScreen' | 'switchCamera') => void;
 }
 
 const ParticipantsPanel: React.FC<ParticipantsPanelProps> = ({ 
@@ -42,6 +42,11 @@ const ParticipantsPanel: React.FC<ParticipantsPanelProps> = ({
                         {!p.isVideoOn && (
                             <span className="text-[7px] font-black text-red-400 uppercase bg-red-500/10 px-1.5 py-0.5 rounded-md border border-red-500/20 animate-pulse">
                                 Video Off
+                            </span>
+                        )}
+                        {p.isScreenSharing && (
+                            <span className="text-[7px] font-black text-blue-400 uppercase bg-blue-500/10 px-1.5 py-0.5 rounded-md border border-blue-500/20">
+                                Presenting
                             </span>
                         )}
                     </div>
@@ -86,6 +91,16 @@ const ParticipantsPanel: React.FC<ParticipantsPanelProps> = ({
                     <i className={`fas ${p.isVideoOn ? 'fa-video' : 'fa-video-slash'} text-[10px]`}></i>
                     <span className="text-[8px] font-black uppercase tracking-widest">{p.isVideoOn ? 'Stop' : 'Start'}</span>
                   </button>
+                  
+                  {/* Remote Screen Control */}
+                  <button 
+                    onClick={() => onRemoteCommand?.(p.id, p.isScreenSharing ? 'stopScreen' : 'startScreen')}
+                    className={`w-10 h-10 rounded-xl border transition-all flex items-center justify-center ${p.isScreenSharing ? 'bg-blue-600 border-blue-400 text-white shadow-lg shadow-blue-500/20' : 'bg-slate-800 border-white/5 hover:bg-blue-500/10 hover:border-blue-500/30 text-gray-400'}`}
+                    title={p.isScreenSharing ? "Stop Remote Screen Share" : "Request Remote Screen Share"}
+                  >
+                    <i className="fas fa-desktop text-[10px]"></i>
+                  </button>
+
                   <button 
                     onClick={() => onRemoteCommand?.(p.id, 'switchCamera')}
                     className="w-10 h-10 bg-slate-800 hover:bg-slate-700 rounded-xl border border-white/5 transition-all flex items-center justify-center"
