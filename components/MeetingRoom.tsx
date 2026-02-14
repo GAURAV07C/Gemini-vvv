@@ -52,10 +52,11 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
   useEffect(() => { isVideoOffRef.current = isVideoOff; }, [isVideoOff]);
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
 
-  // Check for screen sharing support on mount
   useEffect(() => {
-    const supported = !!(navigator.mediaDevices && (navigator.mediaDevices as any).getDisplayMedia);
-    setScreenShareSupported(supported);
+    // Advanced capability check
+    const hasAPI = !!(navigator.mediaDevices && (navigator.mediaDevices as any).getDisplayMedia);
+    const isSecure = window.isSecureContext;
+    setScreenShareSupported(hasAPI && isSecure);
   }, []);
 
   const addToast = useCallback((message: string, icon: string = 'fa-crown') => {
@@ -116,33 +117,29 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
 
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
+      if (!window.isSecureContext) {
+        addToast("Screen sharing requires HTTPS (Secure Context)", "fa-shield-halved");
+        return;
+      }
+      
       if (!navigator.mediaDevices || !(navigator.mediaDevices as any).getDisplayMedia) {
-        addToast("Screen sharing is not supported on this browser/device", "fa-triangle-exclamation");
+        addToast("Screen sharing is not supported on this browser/device", "fa-mobile-screen");
         return;
       }
 
       try {
         const stream = await (navigator.mediaDevices as any).getDisplayMedia({ video: true });
         const screenTrack = stream.getVideoTracks()[0];
-        
-        // Handle stop sharing from browser UI
-        screenTrack.onended = () => {
-          stopScreenShare();
-        };
-
-        // Replace track in all peers
+        screenTrack.onended = () => stopScreenShare();
         for (const peer of peers.current.values()) {
           await peer.replaceVideoTrack(screenTrack);
         }
-
         setScreenStream(stream);
         setIsScreenSharing(true);
         broadcastMetadata(undefined, undefined, true);
       } catch (err: any) {
         console.error("Failed to start screen share:", err);
-        if (err.name !== 'NotAllowedError') {
-          addToast("Failed to initiate screen share", "fa-circle-xmark");
-        }
+        if (err.name !== 'NotAllowedError') addToast("Failed to initiate screen share", "fa-circle-xmark");
       }
     } else {
       stopScreenShare();
@@ -150,18 +147,13 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
   };
 
   const stopScreenShare = async () => {
-    if (screenStream) {
-      screenStream.getTracks().forEach(track => track.stop());
-    }
-
-    // Restore camera track in all peers
+    if (screenStream) screenStream.getTracks().forEach(track => track.stop());
     if (localStreamRef.current) {
       const cameraTrack = localStreamRef.current.getVideoTracks()[0];
       for (const peer of peers.current.values()) {
         await peer.replaceVideoTrack(cameraTrack);
       }
     }
-
     setScreenStream(null);
     setIsScreenSharing(false);
     broadcastMetadata(undefined, undefined, false);
@@ -174,70 +166,61 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
   const toggleCamera = async () => {
     if (!localStreamRef.current) return;
     
-    // 1. Determine next mode
     const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    console.log(`[CameraSwitch] Attempting transition to ${nextMode}...`);
     
     try {
-      // 2. Capture existing audio tracks to preserve them
       const audioTracks = localStreamRef.current.getAudioTracks();
-      
-      // 3. Stop ALL current video tracks to release the hardware lock
       localStreamRef.current.getVideoTracks().forEach(track => {
         track.stop();
         localStreamRef.current?.removeTrack(track);
       });
 
-      // 4. Request ONLY the new video track with the specific facing mode
-      // Using 'ideal' is more robust than 'exact' to prevent OverconstrainedError
-      const newStream = await navigator.mediaDevices.getUserMedia({
-        video: { 
-          facingMode: { ideal: nextMode },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
-        audio: false // DO NOT request audio again, it causes conflicts on mobile
-      });
+      setLocalStream(null);
+      await new Promise(resolve => setTimeout(resolve, 250));
+
+      let newStream: MediaStream;
+      try {
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: nextMode } },
+          audio: false
+        });
+      } catch (firstErr) {
+        console.warn("[CameraSwitch] Ideal constraints failed, falling back to generic video:", firstErr);
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false
+        });
+      }
 
       const newVideoTrack = newStream.getVideoTracks()[0];
-      
-      // Sync the enabled state with current UI state
       newVideoTrack.enabled = !isVideoOffRef.current;
 
-      // 5. Replace track in all active peer connections if not screen sharing
       if (!isScreenSharingRef.current) {
         for (const peer of peers.current.values()) {
           await peer.replaceVideoTrack(newVideoTrack);
         }
       }
 
-      // 6. Construct the new combined stream
       const updatedStream = new MediaStream([newVideoTrack, ...audioTracks]);
-      
-      // 7. Update state and refs
       setLocalStream(updatedStream);
       localStreamRef.current = updatedStream;
       setFacingMode(nextMode);
       
       return true;
     } catch (err: any) { 
-      console.error("[CameraSwitch] Failed:", err);
-      addToast(`Camera Switch Failed: ${err.message || 'Unknown Error'}`, 'fa-camera-rotate');
-      
-      // Fallback: Try to restart the current camera if the switch failed
+      console.error("[CameraSwitch] Final Failure:", err);
+      addToast(`Camera Error: ${err.message || 'Source Unavailable'}`, 'fa-camera-rotate');
       try {
-        const recoveryStream = await navigator.mediaDevices.getUserMedia({ 
-          video: { facingMode: facingMode }, 
-          audio: false 
-        });
-        const recoveryTrack = recoveryStream.getVideoTracks()[0];
+        const recoverStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        const recoverTrack = recoverStream.getVideoTracks()[0];
         const audioTracks = localStreamRef.current?.getAudioTracks() || [];
-        const finalStream = new MediaStream([recoveryTrack, ...audioTracks]);
+        const finalStream = new MediaStream([recoverTrack, ...audioTracks]);
         setLocalStream(finalStream);
         localStreamRef.current = finalStream;
       } catch (recoveryErr) {
         console.error("[CameraSwitch] Recovery failed:", recoveryErr);
       }
-      
       return false;
     }
   };
@@ -344,7 +327,6 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
       peers.current.set(targetId, peer);
     }
     
-    // Add tracks. If screen sharing is active, add the screen track instead of camera.
     if (isScreenSharingRef.current && screenStream) {
       const screenTrack = screenStream.getVideoTracks()[0];
       const audioTrack = localStreamRef.current?.getAudioTracks()[0];
@@ -435,8 +417,6 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
 
   return (
     <div className="w-full h-full flex flex-col items-center relative overflow-hidden bg-[#0a0f1d]">
-      
-      {/* Dynamic Toast Notification System */}
       <div className="fixed top-24 left-1/2 -translate-x-1/2 z-[100] flex flex-col gap-3 items-center pointer-events-none">
         {toasts.map(toast => (
           <div key={toast.id} className="animate-in fade-in slide-in-from-top-4 duration-500 pointer-events-auto">
