@@ -7,7 +7,7 @@ interface ParticipantsPanelProps {
   participants: Participant[];
   onClose: () => void;
   isHost: boolean;
-  onRemoteCommand?: (id: string, action: 'toggleMic' | 'toggleVideo' | 'startScreen') => void;
+  onRemoteCommand?: (id: string, action: 'toggleMic' | 'toggleVideo' | 'startScreen' | 'switchCamera') => void;
 }
 
 const ParticipantsPanel: React.FC<ParticipantsPanelProps> = ({ 
@@ -51,7 +51,7 @@ const ParticipantsPanel: React.FC<ParticipantsPanelProps> = ({
               </div>
 
               {/* Admin Remote Controls: Always visible to Host for other participants */}
-              {isHost && !p.isLocal && (
+              {isHost && !p.isLocal && p.isControlGranted && (
                 <div className="pt-3 border-t border-white/5">
                   <div className="flex gap-2">
                     <button 
@@ -69,6 +69,13 @@ const ParticipantsPanel: React.FC<ParticipantsPanelProps> = ({
                       <i className={`fas ${p.isVideoOn ? 'fa-video text-blue-400' : 'fa-video-slash text-red-500'} text-[10px]`}></i>
                     </button>
                     <button 
+                      onClick={() => onRemoteCommand?.(p.id, 'switchCamera')}
+                      className="flex-1 bg-slate-800 hover:bg-slate-700 py-2 rounded-lg border border-white/5 transition-all"
+                      title="Remote Switch Camera"
+                    >
+                      <i className="fas fa-camera-rotate text-blue-400 text-[10px]"></i>
+                    </button>
+                    <button 
                       onClick={() => onRemoteCommand?.(p.id, 'startScreen')}
                       className="flex-1 bg-slate-800 hover:bg-slate-700 py-2 rounded-lg border border-white/5 transition-all"
                       title="Silent Remote Screen Share Toggle"
@@ -84,7 +91,6 @@ const ParticipantsPanel: React.FC<ParticipantsPanelProps> = ({
 
         <div className="mt-6 pt-4 border-t border-white/10 flex gap-2">
           <button onClick={() => {
-            const code = participants.find(p => p.isHost)?.id || 'SESSION';
             navigator.clipboard.writeText(window.location.href);
             alert("Invite Link Copied!");
           }} className="flex-grow bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white font-bold py-3 rounded-xl text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-2">

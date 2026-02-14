@@ -13,15 +13,18 @@ interface ControlsProps {
   onToggleHandRaise: () => void;
   onToggleParticipants: () => void;
   onLeave: () => void;
+  onSwitchCamera?: () => void;
   roomId: string;
   participantCount: number;
   screenShareSupported?: boolean;
+  hasMultipleCameras?: boolean;
 }
 
 const Controls: React.FC<ControlsProps> = ({ 
   isMuted, isVideoOff, isScreenSharing, isHandRaised, showParticipants, 
   onToggleMute, onToggleVideo, onToggleScreenShare, onToggleHandRaise, onToggleParticipants, 
-  onLeave, roomId, participantCount, screenShareSupported = true
+  onLeave, onSwitchCamera, roomId, participantCount, screenShareSupported = true,
+  hasMultipleCameras = false
 }) => {
   return (
     <div className="flex flex-wrap items-center justify-center gap-3 md:gap-4 bg-slate-900/90 backdrop-blur-xl px-4 py-3 md:px-6 md:py-4 rounded-3xl border border-white/10 shadow-2xl">
@@ -55,6 +58,17 @@ const Controls: React.FC<ControlsProps> = ({
       >
         <i className={`fas ${isVideoOff ? 'fa-video-slash text-red-500' : 'fa-video text-white'} text-lg`}></i>
       </button>
+
+      {/* Camera Switch Toggle (Mobile/Multi-Cam only) */}
+      {hasMultipleCameras && (
+        <button 
+          onClick={onSwitchCamera}
+          className="w-11 h-11 md:w-12 md:h-12 rounded-full flex items-center justify-center bg-slate-800 border border-white/5 hover:bg-slate-700 transition-all"
+          title="Switch Camera"
+        >
+          <i className="fas fa-camera-rotate text-white text-lg"></i>
+        </button>
+      )}
 
       <div className="relative">
         <button 
