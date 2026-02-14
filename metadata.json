@@ -1,0 +1,10 @@
+{
+  "name": "Copy of OmniRTC - Advanced Video Calling",
+  "description": "A robust WebRTC application featuring video/audio calls, screen sharing, and automatic room persistence for session recovery.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture",
+    "geolocation"
+  ]
+}
