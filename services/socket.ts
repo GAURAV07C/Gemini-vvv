@@ -26,14 +26,30 @@ export class SignalingService {
     return this.instance;
   }
 
+  /**
+   * Updates the message handler callback. 
+   * Vital for React components to avoid stale closures.
+   */
+  updateCallback(onMessage: (msg: SignalPayload) => void) {
+    this.onMessageCallback = onMessage;
+  }
+
   joinRoom(roomId: string, userId: string, displayName: string, isHost: boolean, onMessage: (msg: SignalPayload) => void) {
     this.onMessageCallback = onMessage;
     this.userId = userId;
     this.userName = displayName;
     this.roomId = roomId.toUpperCase();
 
-    const peerId = isHost ? `OMNI_ROOM_${this.roomId}` : `OMNI_USER_${userId}_${Math.floor(Math.random() * 10000)}`;
+    // Deterministic Peer ID prevents duplicate participants on refresh
+    const peerId = isHost 
+      ? `OMNI_ROOM_${this.roomId}` 
+      : `OMNI_USER_${this.roomId}_${userId}`;
     
+    // Cleanup existing peer if any (e.g. on manual re-join)
+    if (this.peer && !this.peer.destroyed) {
+      this.peer.destroy();
+    }
+
     this.peer = new Peer(peerId, {
       debug: 1,
       config: {
@@ -56,7 +72,13 @@ export class SignalingService {
     });
 
     this.peer.on('error', (err) => {
-      console.error('[Socket] Signaling Error:', err.type);
+      console.warn('[Socket] Signaling Error:', err.type);
+      // Handle ID taken - usually happens if refresh is too fast and old connection is still alive
+      if (err.type === 'id-taken' && !isHost) {
+        console.log('[Socket] Peer ID taken, retrying with suffix...');
+        // Fallback to random suffix if primary ID is locked
+        this.joinRoom(roomId, `${userId}_${Math.floor(Math.random() * 1000)}`, displayName, isHost, onMessage);
+      }
     });
   }
 
@@ -78,7 +100,6 @@ export class SignalingService {
       }
       this.connections.set(conn.peer, conn);
       
-      // Notify the other end about my arrival
       conn.send({
         type: 'JOIN',
         senderId: this.userId,
@@ -90,7 +111,6 @@ export class SignalingService {
     conn.on('data', (data) => {
       const msg = data as SignalPayload;
       
-      // Update local maps
       if (msg.senderId) {
         this.userIdToPeerId.set(msg.senderId, conn.peer);
         if (msg.senderName) this.userIdToName.set(msg.senderId, msg.senderName);
@@ -99,18 +119,14 @@ export class SignalingService {
       const isHost = this.peer?.id.startsWith('OMNI_ROOM_');
       
       if (isHost) {
-        // If Host receives a targeted message for someone else, relay it
         if (msg.targetId && msg.targetId !== this.userId) {
           this.relayToTarget(msg);
           return;
         } 
         
-        // If Host receives a JOIN, broadcast it to everyone else
         if (msg.type === 'JOIN' && !msg.targetId) {
           this.broadcastToOthers(msg, conn.peer);
           
-          // CRITICAL: Host must also tell the NEWCOMER about everyone already in the room
-          // 1. Send Host's identity to newcomer
           conn.send({
             type: 'JOIN',
             senderId: this.userId,
@@ -118,7 +134,6 @@ export class SignalingService {
             roomId: this.roomId
           });
           
-          // 2. Send other participants' identities to newcomer
           this.userIdToPeerId.forEach((pid, uid) => {
             if (uid !== this.userId && uid !== msg.senderId) {
               conn.send({
@@ -171,7 +186,6 @@ export class SignalingService {
         }
       }
     }
-    // Default: Broadcast to all direct connections (for participants, this is just the host)
     this.connections.forEach(conn => conn.send(payload));
   }
 

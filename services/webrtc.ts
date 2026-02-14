@@ -2,9 +2,7 @@
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' }
+    { urls: 'stun:stun1.l.google.com:19302' }
   ],
   iceCandidatePoolSize: 10,
 };
@@ -28,118 +26,80 @@ export class WebRTCService {
 
   private setupListeners() {
     this.pc.ontrack = (event) => {
-      console.log("[WebRTC] Track detected:", event.track.kind);
-      
-      // Add track to our permanent remoteStream object
-      if (event.streams && event.streams[0]) {
-        // Many browsers provide the stream directly
-        event.streams[0].getTracks().forEach(track => {
-          if (!this.remoteStream.getTracks().includes(track)) {
-            this.remoteStream.addTrack(track);
-          }
-        });
-      } else {
-        // Fallback: add individual track
-        this.remoteStream.addTrack(event.track);
-      }
-      
-      // Always notify the UI with our managed stream object
+      console.log("[SFU-Engine] Remote track received:", event.track.kind);
+      event.streams[0].getTracks().forEach(track => {
+        if (!this.remoteStream.getTracks().find(t => t.id === track.id)) {
+          this.remoteStream.addTrack(track);
+        }
+      });
       this.onTrackCallback(this.remoteStream);
     };
 
     this.pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.onIceCandidateCallback(event.candidate);
-      }
+      if (event.candidate) this.onIceCandidateCallback(event.candidate);
     };
 
     this.pc.oniceconnectionstatechange = () => {
-      console.log("[WebRTC] Connection State:", this.pc.iceConnectionState);
-      if (this.pc.iceConnectionState === 'failed') {
-        this.pc.restartIce();
-      }
+      if (this.pc.iceConnectionState === 'failed') this.pc.restartIce();
     };
   }
 
   async createOffer() {
-    try {
-      const offer = await this.pc.createOffer({
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: true
-      });
-      await this.pc.setLocalDescription(offer);
-      return offer;
-    } catch (e) {
-      console.error("[WebRTC] Create Offer Error:", e);
-      throw e;
-    }
+    const offer = await this.pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    await this.pc.setLocalDescription(offer);
+    return offer;
   }
 
   async handleOffer(offer: RTCSessionDescriptionInit) {
-    try {
-      await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await this.pc.createAnswer();
-      await this.pc.setLocalDescription(answer);
-      
-      // Process any candidates that arrived early
-      while (this.candidateQueue.length > 0) {
-        const cand = this.candidateQueue.shift();
-        if (cand) await this.pc.addIceCandidate(new RTCIceCandidate(cand));
-      }
-      
-      return answer;
-    } catch (e) {
-      console.error("[WebRTC] Handle Offer Error:", e);
-      throw e;
-    }
+    await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
+    this.processQueue();
+    return answer;
   }
 
   async handleAnswer(answer: RTCSessionDescriptionInit) {
-    try {
-      if (this.pc.signalingState !== 'stable') {
-        await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
-        
-        while (this.candidateQueue.length > 0) {
-          const cand = this.candidateQueue.shift();
-          if (cand) await this.pc.addIceCandidate(new RTCIceCandidate(cand));
-        }
-      }
-    } catch (e) {
-      console.error("[WebRTC] Handle Answer Error:", e);
+    if (this.pc.signalingState !== 'stable') {
+      await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
+      this.processQueue();
+    }
+  }
+
+  private async processQueue() {
+    while (this.candidateQueue.length > 0) {
+      const cand = this.candidateQueue.shift();
+      if (cand) await this.pc.addIceCandidate(new RTCIceCandidate(cand));
     }
   }
 
   async addIceCandidate(candidate: RTCIceCandidateInit) {
-    try {
-      if (!this.pc.remoteDescription) {
-        this.candidateQueue.push(candidate);
-      } else {
-        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
-      }
-    } catch (e) {
-      console.debug("[WebRTC] Candidate ignored:", e);
+    if (!this.pc.remoteDescription) {
+      this.candidateQueue.push(candidate);
+    } else {
+      await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
     }
   }
 
   addTracks(stream: MediaStream) {
     if (!stream) return;
-    const currentTracks = this.pc.getSenders().map(s => s.track);
+    const senders = this.pc.getSenders();
     stream.getTracks().forEach((track) => {
-      if (!currentTracks.includes(track)) {
+      const alreadyExists = senders.find(s => s.track?.id === track.id || s.track?.kind === track.kind);
+      if (!alreadyExists) {
         this.pc.addTrack(track, stream);
       }
     });
   }
 
   async replaceVideoTrack(newTrack: MediaStreamTrack) {
-    const senders = this.pc.getSenders();
-    const videoSender = senders.find(s => s.track?.kind === 'video');
+    const videoSender = this.pc.getSenders().find(s => s.track?.kind === 'video');
     if (videoSender) {
       await videoSender.replaceTrack(newTrack);
     }
   }
 
   close() {
+    this.pc.getSenders().forEach(s => this.pc.removeTrack(s));
     this.pc.close();
   }
 }

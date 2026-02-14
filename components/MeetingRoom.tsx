@@ -8,6 +8,13 @@ import ChatPanel from './ChatPanel';
 import { WebRTCService } from '../services/webrtc';
 import { SignalingService, SignalPayload } from '../services/socket';
 
+interface Toast {
+  id: string;
+  message: string;
+  icon: string;
+  type: 'host-action' | 'system';
+}
+
 interface MeetingRoomProps {
   session: UserSession;
   onLeave: () => void;
@@ -26,65 +33,112 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
   const [showChat, setShowChat] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [hasMultipleCameras, setHasMultipleCameras] = useState(false);
+  const [toasts, setToasts] = useState<Toast[]>([]);
   
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [reactions, setReactions] = useState<Map<string, string>>(new Map());
   
   const peers = useRef<Map<string, WebRTCService>>(new Map());
   const sigService = useRef<SignalingService>(SignalingService.getInstance());
   const localStreamRef = useRef<MediaStream | null>(null);
 
-  const broadcastMetadata = useCallback((audioOverride?: boolean, videoOverride?: boolean) => {
+  const isMutedRef = useRef(isMuted);
+  const isVideoOffRef = useRef(isVideoOff);
+  useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
+  useEffect(() => { isVideoOffRef.current = isVideoOff; }, [isVideoOff]);
+
+  const addToast = useCallback((message: string, icon: string = 'fa-crown') => {
+    const id = Math.random().toString(36).substr(2, 9);
+    setToasts(prev => [...prev, { id, message, icon, type: 'host-action' }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 5000);
+  }, []);
+
+  const broadcastMetadata = useCallback((audio?: boolean, video?: boolean) => {
     sigService.current.sendSignal({
       type: 'METADATA', senderId: session.userId, senderName: session.displayName,
       roomId: session.roomId, data: { 
-        audio: audioOverride !== undefined ? audioOverride : !isMuted, 
-        video: videoOverride !== undefined ? videoOverride : !isVideoOff 
+        audio: audio !== undefined ? audio : !isMutedRef.current, 
+        video: video !== undefined ? video : !isVideoOffRef.current 
       }
     });
-  }, [isMuted, isVideoOff, session]);
+  }, [session]);
 
-  const toggleCamera = useCallback(async () => {
+  const playNotificationSound = useCallback(() => {
+    try {
+      const AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      gain.gain.setValueAtTime(0.05, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.3);
+    } catch (e) { console.warn("Audio feedback blocked."); }
+  }, []);
+
+  const toggleMic = useCallback((forced?: boolean) => {
+    setIsMuted(prev => {
+      const next = forced !== undefined ? forced : !prev;
+      if (localStreamRef.current) {
+        localStreamRef.current.getAudioTracks().forEach(t => t.enabled = !next);
+      }
+      return next;
+    });
+  }, []);
+
+  const toggleVideo = useCallback((forced?: boolean) => {
+    setIsVideoOff(prev => {
+      const next = forced !== undefined ? forced : !prev;
+      if (localStreamRef.current) {
+        localStreamRef.current.getVideoTracks().forEach(t => t.enabled = !next);
+      }
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    broadcastMetadata(!isMuted, !isVideoOff);
+  }, [isMuted, isVideoOff, broadcastMetadata]);
+
+  const toggleCamera = async () => {
     if (!localStreamRef.current) return;
-    
     const nextMode = facingMode === 'user' ? 'environment' : 'user';
     try {
-      // Create new stream with opposite facing mode
       const newStream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: nextMode } },
-        audio: !isMuted
+        audio: true
       });
-
       const newVideoTrack = newStream.getVideoTracks()[0];
-      const oldVideoTrack = localStreamRef.current.getVideoTracks()[0];
+      newVideoTrack.enabled = !isVideoOffRef.current;
 
-      // Replace tracks in all peer connections
       for (const peer of peers.current.values()) {
         await peer.replaceVideoTrack(newVideoTrack);
       }
 
-      // Update local state
       const updatedStream = new MediaStream([newVideoTrack, ...localStreamRef.current.getAudioTracks()]);
       setLocalStream(updatedStream);
       localStreamRef.current = updatedStream;
       setFacingMode(nextMode);
-
-      // Stop old track
-      oldVideoTrack.stop();
-      
-      console.log(`[MeetingRoom] Camera switched to: ${nextMode}`);
-    } catch (err) {
-      console.error("Camera switch failed:", err);
+      return true;
+    } catch (err) { 
+      console.error("Camera switch failed", err); 
+      return false;
     }
-  }, [facingMode, isMuted]);
+  };
 
-  const handleSignaling = async (msg: SignalPayload) => {
+  const handleSignaling = useCallback(async (msg: SignalPayload) => {
     switch (msg.type) {
       case 'JOIN':
         if (msg.senderId !== session.userId) {
           const shouldOffer = session.userId < msg.senderId;
           createPeer(msg.senderId, msg.senderName, shouldOffer);
+          if (session.isHost) broadcastMetadata();
         }
         break;
       case 'OFFER':
@@ -101,42 +155,35 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
       case 'CANDIDATE':
         peers.current.get(msg.senderId)?.addIceCandidate(msg.data);
         break;
-      case 'SCREEN_STATUS':
-        setParticipants(prev => prev.map(p => 
-          p.id === msg.senderId ? { ...p, isScreenSharing: msg.data } : p
-        ));
-        break;
       case 'METADATA':
         setParticipants(prev => {
-          const exists = prev.find(p => p.id === msg.senderId);
-          if (!exists) {
-            return [...prev, {
-              id: msg.senderId, name: msg.senderName, isLocal: false, 
-              isVideoOn: msg.data.video, isAudioOn: msg.data.audio, isHost: false,
-              isControlGranted: true // Mocking full access for demo purposes as requested
-            }];
-          }
-          return prev.map(p => p.id === msg.senderId ? { ...p, isAudioOn: msg.data.audio, isVideoOn: msg.data.video } : p);
+          const idx = prev.findIndex(p => p.id === msg.senderId);
+          const newData = {
+            id: msg.senderId, name: msg.senderName, isLocal: false, 
+            isVideoOn: msg.data.video, isAudioOn: msg.data.audio, isHost: false,
+            isControlGranted: true
+          };
+          if (idx === -1) return [...prev, newData];
+          const next = [...prev];
+          next[idx] = { ...next[idx], ...newData };
+          return next;
         });
-        break;
-      case 'CHAT':
-        setMessages(prev => [...prev, { ...msg.data, isLocal: false }]);
-        break;
-      case 'REACTION':
-        setReactions(prev => new Map(prev).set(msg.senderId, msg.data));
         break;
       case 'REMOTE_COMMAND':
         if (msg.targetId === session.userId) {
-          if (msg.data.action === 'switchCamera') {
+          const action = msg.data.action;
+          playNotificationSound();
+          if (action === 'toggleMic') {
+            const currentMuted = isMutedRef.current;
+            toggleMic();
+            addToast(`Host has ${currentMuted ? 'unmuted' : 'muted'} your microphone`, currentMuted ? 'fa-microphone' : 'fa-microphone-slash');
+          } else if (action === 'toggleVideo') {
+            const currentVideoOff = isVideoOffRef.current;
+            toggleVideo();
+            addToast(`Host has ${currentVideoOff ? 'started' : 'stopped'} your camera`, currentVideoOff ? 'fa-video' : 'fa-video-slash');
+          } else if (action === 'switchCamera') {
             await toggleCamera();
-          } else if (msg.data.action === 'toggleMic') {
-            const next = !isMuted; setIsMuted(next); 
-            localStreamRef.current?.getAudioTracks().forEach(t => t.enabled = !next);
-            broadcastMetadata(!next, !isVideoOff);
-          } else if (msg.data.action === 'toggleVideo') {
-            const next = !isVideoOff; setIsVideoOff(next); 
-            localStreamRef.current?.getVideoTracks().forEach(t => t.enabled = !next);
-            broadcastMetadata(!isMuted, !next);
+            addToast(`Host has remotely switched your active camera`, 'fa-camera-rotate');
           }
         }
         break;
@@ -151,7 +198,11 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
         setParticipants(prev => prev.filter(p => p.id !== msg.senderId));
         break;
     }
-  };
+  }, [session, toggleMic, toggleVideo, playNotificationSound, addToast]);
+
+  useEffect(() => {
+    sigService.current.updateCallback(handleSignaling);
+  }, [handleSignaling]);
 
   const createPeer = (targetId: string, name: string, shouldOffer: boolean) => {
     let peer = peers.current.get(targetId);
@@ -159,9 +210,9 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
       peer = new WebRTCService(
         (stream) => {
           setRemoteStreams(prev => {
-              const next = new Map(prev);
-              next.set(targetId, stream);
-              return next;
+            const next = new Map(prev);
+            next.set(targetId, stream);
+            return next;
           });
         },
         (candidate) => sigService.current.sendSignal({
@@ -172,10 +223,12 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
       peers.current.set(targetId, peer);
     }
     if (localStreamRef.current) peer.addTracks(localStreamRef.current);
+    
     setParticipants(prev => {
       if (prev.find(p => p.id === targetId)) return prev;
-      return [...prev, { id: targetId, name: name || 'Participant', isLocal: false, isVideoOn: true, isAudioOn: true, isHost: false, isControlGranted: true }];
+      return [...prev, { id: targetId, name, isLocal: false, isVideoOn: true, isAudioOn: true, isHost: false }];
     });
+
     if (shouldOffer) {
       peer.createOffer().then(offer => {
         sigService.current.sendSignal({
@@ -187,37 +240,6 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
     return peer;
   };
 
-  const toggleScreenShare = async () => {
-    try {
-      if (!isScreenSharing) {
-        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-        setScreenStream(stream);
-        setIsScreenSharing(true);
-        const screenVideoTrack = stream.getVideoTracks()[0];
-        screenVideoTrack.onended = () => stopScreenSharing();
-        for (const peer of peers.current.values()) {
-          await peer.replaceVideoTrack(screenVideoTrack);
-        }
-        sigService.current.sendSignal({ type: 'SCREEN_STATUS', senderId: session.userId, senderName: session.displayName, roomId: session.roomId, data: true });
-      } else {
-        await stopScreenSharing();
-      }
-    } catch (err) { console.error("Screen share failed", err); }
-  };
-
-  const stopScreenSharing = async () => {
-    screenStream?.getTracks().forEach(t => t.stop());
-    setScreenStream(null);
-    setIsScreenSharing(false);
-    if (localStreamRef.current) {
-      const cameraTrack = localStreamRef.current.getVideoTracks()[0];
-      for (const peer of peers.current.values()) {
-        await peer.replaceVideoTrack(cameraTrack);
-      }
-    }
-    sigService.current.sendSignal({ type: 'SCREEN_STATUS', senderId: session.userId, senderName: session.displayName, roomId: session.roomId, data: false });
-  };
-
   useEffect(() => {
     const init = async () => {
       onStatusChange(CallStatus.CONNECTING);
@@ -225,21 +247,12 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         setLocalStream(stream);
         localStreamRef.current = stream;
-        
-        // Check for multiple cameras
         const devices = await navigator.mediaDevices.enumerateDevices();
-        const videoDevices = devices.filter(d => d.kind === 'videoinput');
-        setHasMultipleCameras(videoDevices.length > 1 || /Android|iPhone|iPad/i.test(navigator.userAgent));
-
+        setHasMultipleCameras(devices.filter(d => d.kind === 'videoinput').length > 1);
         setParticipants([{ id: session.userId, name: session.displayName, isLocal: true, isVideoOn: true, isAudioOn: true, isHost: session.isHost }]);
         sigService.current.joinRoom(session.roomId, session.userId, session.displayName, session.isHost, handleSignaling);
         onStatusChange(CallStatus.CONNECTED);
-        const timer = setInterval(() => broadcastMetadata(), 5000);
-        return () => clearInterval(timer);
-      } catch (e) { 
-        console.error("Media init error:", e);
-        onStatusChange(CallStatus.DISCONNECTED); 
-      }
+      } catch (e) { onStatusChange(CallStatus.DISCONNECTED); }
     };
     init();
     return () => {
@@ -253,22 +266,36 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
   const isInTheaterMode = isScreenSharing || !!remoteScreenParticipant;
 
   return (
-    <div className="w-full h-full flex flex-col items-center relative overflow-hidden">
-      {isScreenSharing && (
-        <div className="fixed top-24 left-1/2 -translate-x-1/2 z-[60] animate-in fade-in slide-in-from-top-4 duration-500">
-          <div className="bg-blue-600/90 backdrop-blur-md border border-blue-400/30 px-6 py-2 rounded-2xl shadow-2xl flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
-              <span className="text-[10px] font-black uppercase tracking-widest text-white">You are presenting to everyone</span>
+    <div className="w-full h-full flex flex-col items-center relative overflow-hidden bg-[#0a0f1d]">
+      
+      {/* Dynamic Toast Notification System */}
+      <div className="fixed top-24 left-1/2 -translate-x-1/2 z-[100] flex flex-col gap-3 items-center pointer-events-none">
+        {toasts.map(toast => (
+          <div key={toast.id} className="animate-in fade-in slide-in-from-top-4 duration-500 pointer-events-auto">
+            <div className="bg-blue-600/90 backdrop-blur-2xl border border-blue-400/30 px-6 py-4 rounded-[1.5rem] shadow-[0_20px_50px_rgba(0,0,0,0.5)] flex items-center gap-4 text-white min-w-[320px]">
+              <div className="w-10 h-10 bg-white/10 rounded-full flex items-center justify-center border border-white/20 shadow-inner">
+                <i className={`fas ${toast.icon} text-xs text-blue-200`}></i>
+              </div>
+              <div className="flex flex-col">
+                <div className="flex items-center gap-2">
+                  <span className="text-[9px] font-black uppercase tracking-[0.2em] text-blue-200/70">Room Authority</span>
+                  <div className="w-1 h-1 bg-blue-400 rounded-full animate-pulse"></div>
+                </div>
+                <span className="text-sm font-bold tracking-tight text-white/95">{toast.message}</span>
+              </div>
+              <button 
+                onClick={() => setToasts(prev => prev.filter(t => t.id !== toast.id))}
+                className="ml-auto text-white/40 hover:text-white transition-colors"
+              >
+                <i className="fas fa-times text-[10px]"></i>
+              </button>
             </div>
-            <div className="h-4 w-px bg-white/20"></div>
-            <button onClick={toggleScreenShare} className="bg-red-500 hover:bg-red-400 text-white text-[9px] font-black uppercase tracking-widest px-3 py-1.5 rounded-lg transition-all shadow-lg active:scale-95">Stop Sharing</button>
           </div>
-        </div>
-      )}
+        ))}
+      </div>
 
-      <div className={`w-full max-w-7xl flex-grow p-4 md:p-10 mb-24 flex gap-6 overflow-hidden h-full`}>
-        <div className={`flex-grow grid gap-6 ${isInTheaterMode ? 'grid-cols-4 grid-rows-4' : 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3'}`}>
+      <div className={`w-full max-w-7xl flex-grow p-4 md:p-8 mb-24 flex gap-6 overflow-hidden h-full`}>
+        <div className={`flex-grow grid gap-4 md:gap-6 ${isInTheaterMode ? 'grid-cols-4 grid-rows-4' : 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3'}`}>
           {isInTheaterMode && (
             <div className="col-span-4 row-span-3 lg:col-span-3 lg:row-span-4 h-full">
               <VideoTile 
@@ -278,17 +305,15 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
               />
             </div>
           )}
-
-          <div className={`${isInTheaterMode ? 'col-span-1 row-span-1 h-[120px] lg:h-auto' : 'h-[300px] md:h-[350px]'}`}>
-            <VideoTile stream={localStream} label={`${session.displayName} (You)`} isLocal isVideoOff={isVideoOff} isMuted={isMuted} reaction={reactions.get(session.userId)} isSelfScreenSharing={isScreenSharing} />
+          <div className={`${isInTheaterMode ? 'col-span-1 row-span-1 h-[140px]' : 'h-[300px] md:h-[350px]'}`}>
+            <VideoTile stream={localStream} label={`${session.displayName} (You)`} isLocal isVideoOff={isVideoOff} isMuted={isMuted} />
           </div>
-
           {Array.from(remoteStreams.entries()).map(([peerId, stream]) => {
             const pData = participants.find(p => p.id === peerId);
             if (isInTheaterMode && pData?.isScreenSharing && !isScreenSharing) return null; 
             return (
-              <div key={peerId} className={`${isInTheaterMode ? 'col-span-1 row-span-1 h-[120px] lg:h-auto' : 'h-[300px] md:h-[350px]'}`}>
-                <VideoTile stream={stream} label={pData?.name || "Participant"} reaction={reactions.get(peerId)} isMuted={!pData?.isAudioOn} isVideoOff={!pData?.isVideoOn} isScreenSharing={pData?.isScreenSharing} />
+              <div key={peerId} className={`${isInTheaterMode ? 'col-span-1 row-span-1 h-[140px]' : 'h-[300px] md:h-[350px]'}`}>
+                <VideoTile stream={stream} label={pData?.name || "Participant"} isMuted={!pData?.isAudioOn} isVideoOff={!pData?.isVideoOn} />
               </div>
             );
           })}
@@ -299,17 +324,9 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
         <Controls 
           isMuted={isMuted} isVideoOff={isVideoOff} isScreenSharing={isScreenSharing} isHandRaised={false} showParticipants={showParticipants} 
           hasMultipleCameras={hasMultipleCameras}
-          onToggleMute={() => { 
-            const next = !isMuted; setIsMuted(next); 
-            localStream?.getAudioTracks().forEach(t => t.enabled = !next); 
-            broadcastMetadata(!next, !isVideoOff); // Sync immediately
-          }}
-          onToggleVideo={() => { 
-            const next = !isVideoOff; setIsVideoOff(next); 
-            localStream?.getVideoTracks().forEach(t => t.enabled = !next); 
-            broadcastMetadata(!isMuted, !next); // Sync immediately
-          }} 
-          onToggleScreenShare={toggleScreenShare} 
+          onToggleMute={() => toggleMic()}
+          onToggleVideo={() => toggleVideo()} 
+          onToggleScreenShare={() => {}} 
           onToggleHandRaise={() => {}} 
           onToggleParticipants={() => setShowParticipants(!showParticipants)} 
           onLeave={onLeave} 
@@ -317,9 +334,6 @@ const MeetingRoom: React.FC<MeetingRoomProps> = ({ session, onLeave, onStatusCha
           participantCount={participants.length}
           onSwitchCamera={toggleCamera}
         />
-        <button onClick={() => setShowChat(!showChat)} className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all border ${showChat ? 'bg-blue-600 border-blue-400 shadow-xl' : 'bg-slate-900 border-white/10 hover:bg-slate-800'}`}>
-          <i className="fas fa-comments text-blue-400 text-lg"></i>
-        </button>
       </div>
       <ParticipantsPanel 
         isOpen={showParticipants} 
